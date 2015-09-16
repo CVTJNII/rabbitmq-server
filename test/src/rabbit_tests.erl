@@ -29,6 +29,7 @@
 -define(TRANSIENT_MSG_STORE,  msg_store_transient).
 -define(CLEANUP_QUEUE_NAME, <<"cleanup-queue">>).
 -define(TIMEOUT, 30000).
+-define(TIMEOUT_LIST_OPS_PASS, 1000).
 
 all_tests() ->
     try
@@ -74,6 +75,7 @@ all_tests0() ->
     passed = test_ha_policy_validation(),
     passed = test_queue_master_location_policy_validation(),
     passed = test_server_status(),
+    passed = test_list_operations_timeout_pass(),
     passed = test_amqp_connection_refusal(),
     passed = test_confirms(),
     passed = test_with_state(),
@@ -1239,6 +1241,102 @@ test_server_status() ->
 
     passed.
 
+test_list_operations_timeout_pass() ->
+    %% create a few things so there is some useful information to list
+    {_Writer, Limiter, Ch} = test_channel(),
+    [Q, Q2] = [Queue || Name <- [<<"foo">>, <<"bar">>],
+                        {new, Queue = #amqqueue{}} <-
+                            [rabbit_amqqueue:declare(
+                               rabbit_misc:r(<<"/">>, queue, Name),
+                               false, false, [], none)]],
+    ok = rabbit_amqqueue:basic_consume(
+           Q, true, Ch, Limiter, false, 0, <<"ctag">>, true, [], undefined),
+
+    %% list users
+    ok = control_action(add_user, ["foo", "bar"]),
+    {error, {user_already_exists, _}} =
+        control_action(add_user, ["foo", "bar"]),
+    ok = control_action(list_users, [], ?TIMEOUT_LIST_OPS_PASS),
+    
+    %% list parameters
+    ok = rabbit_runtime_parameters_test:register(),
+    ok = control_action(set_parameter, ["test", "good", "123"]),
+    ok = control_action(list_parameters, [], ?TIMEOUT_LIST_OPS_PASS),
+    ok = control_action(clear_parameter, ["test", "good"]),
+    rabbit_runtime_parameters_test:unregister(),
+
+    %% list vhosts
+    ok = control_action(add_vhost, ["/testhost"]),
+    {error, {vhost_already_exists, _}} =
+        control_action(add_vhost, ["/testhost"]),
+    ok = control_action(list_vhosts, [], ?TIMEOUT_LIST_OPS_PASS),
+
+    %% list permissions
+    ok = control_action(set_permissions, ["foo", ".*", ".*", ".*"],
+                        [{"-p", "/testhost"}]),
+    ok = control_action(list_permissions, [], [{"-p", "/testhost"}],
+                        ?TIMEOUT_LIST_OPS_PASS),
+
+    %% list user permissions
+    ok = control_action(list_user_permissions, ["foo"],
+                        ?TIMEOUT_LIST_OPS_PASS),
+
+    %% list policies
+    ok = control_action_opts(["set_policy", "name", ".*",
+                              "{\"ha-mode\":\"all\"}"]),
+    ok = control_action(list_policies, [], ?TIMEOUT_LIST_OPS_PASS),
+    ok = control_action(clear_policy, ["name"]),
+
+    %% list queues
+    ok = info_action(list_queues, rabbit_amqqueue:info_keys(), true,
+                     ?TIMEOUT_LIST_OPS_PASS),
+
+    %% list exchanges
+    ok = info_action(list_exchanges, rabbit_exchange:info_keys(), true,
+                     ?TIMEOUT_LIST_OPS_PASS),
+
+    %% list bindings
+    ok = info_action(list_bindings, rabbit_binding:info_keys(), true,
+                     ?TIMEOUT_LIST_OPS_PASS),
+
+    %% list connections
+    {H, P} = find_listener(),
+    {ok, C} = gen_tcp:connect(H, P, []),
+    gen_tcp:send(C, <<"AMQP", 0, 0, 9, 1>>),
+    timer:sleep(100),
+    ok = info_action(list_connections,
+                     rabbit_networking:connection_info_keys(), false,
+                     ?TIMEOUT_LIST_OPS_PASS),
+
+    %% list consumers
+    ok = control_action(list_consumers, [], ?TIMEOUT_LIST_OPS_PASS),
+
+    %% do some cleaning up
+    ok = control_action(delete_user, ["foo"]),
+    {error, {no_such_user, _}} =
+        control_action(delete_user, ["foo"]),
+
+    ok = control_action(delete_vhost, ["/testhost"]),
+    {error, {no_such_vhost, _}} =
+        control_action(delete_vhost, ["/testhost"]),
+
+    %% close_connection
+    [ConnPid] = rabbit_networking:connections(),
+    ok = control_action(close_connection, [rabbit_misc:pid_to_string(ConnPid),
+                                           "go away"]),
+
+    %% list channels
+    ok = info_action(list_channels, rabbit_channel:info_keys(), false,
+                     ?TIMEOUT_LIST_OPS_PASS),
+
+    %% cleanup
+    [{ok, _} = rabbit_amqqueue:delete(QR, false, false) || QR <- [Q, Q2]],
+
+    unlink(Ch),
+    ok = rabbit_channel:shutdown(Ch),
+
+    passed.
+
 test_amqp_connection_refusal() ->
     [passed = test_amqp_connection_refusal(V) ||
         V <- [<<"AMQP",9,9,9,9>>, <<"AMQP",0,1,0,0>>, <<"XXXX",0,0,9,1>>]],
@@ -1775,9 +1873,17 @@ dead_queue_loop(QueueName, OldPid) ->
 control_action(Command, Args) ->
     control_action(Command, node(), Args, default_options()).
 
+control_action(Command, Args, Timeout) when is_number(Timeout) ->
+    control_action(Command, node(), Args, default_options(), Timeout);
+
 control_action(Command, Args, NewOpts) ->
     control_action(Command, node(), Args,
                    expand_options(default_options(), NewOpts)).
+
+control_action(Command, Args, NewOpts, Timeout) when is_number(Timeout) ->
+    control_action(Command, node(), Args,
+                   expand_options(default_options(), NewOpts),
+                   Timeout);
 
 control_action(Command, Node, Args, Opts) ->
     case catch rabbit_control_main:action(
@@ -1785,6 +1891,20 @@ control_action(Command, Node, Args, Opts) ->
                  fun (Format, Args1) ->
                          io:format(Format ++ " ...~n", Args1)
                  end) of
+        ok ->
+            io:format("done.~n"),
+            ok;
+        Other ->
+            io:format("failed.~n"),
+            Other
+    end.
+
+control_action(Command, Node, Args, Opts, Timeout) when is_number(Timeout) ->
+    case catch rabbit_control_main:action(
+                 Command, Node, Args, Opts,
+                 fun (Format, Args1) ->
+                         io:format(Format ++ " ...~n", Args1)
+                 end, Timeout) of
         ok ->
             io:format("done.~n"),
             ok;
@@ -1812,6 +1932,14 @@ info_action(Command, Args, CheckVHost) ->
     end,
     ok = control_action(Command, lists:map(fun atom_to_list/1, Args)),
     {bad_argument, dummy} = control_action(Command, ["dummy"]),
+    ok.
+
+info_action(Command, Args, CheckVHost, Timeout) when is_number(Timeout) ->
+    ok = control_action(Command, [], Timeout),
+    if CheckVHost -> ok = control_action(Command, [], ["-p", "/"], Timeout);
+       true       -> ok
+    end,
+    ok = control_action(Command, lists:map(fun atom_to_list/1, Args), Timeout),
     ok.
 
 default_options() -> [{"-p", "/"}, {"-q", "false"}].
